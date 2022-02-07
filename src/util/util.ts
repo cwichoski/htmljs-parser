@@ -1,14 +1,7 @@
-import { CODE, ValuePart } from "../internal";
+import { CODE, STATE } from "../internal";
 
-export function cloneValue<T extends ValuePart>(data: T) {
-  return {
-    value: data.value,
-    pos: data.pos,
-    endPos: data.endPos,
-  } as ValuePart;
-}
-
-export function getTagName(tag: any) {
+export function getTagName(tag: STATE.OpenTagPart) {
+  // TODO: instead of substringing the tagName, we should string compare two ranges in the source text.
   return tag.tagName.pos === undefined ? "" : tag.tagName.value;
 }
 

@@ -4,13 +4,11 @@ import {
   isWhitespaceCode,
   StateDefinition,
   Part,
-  ValuePart,
   Parser,
   operators,
 } from "../internal";
 
 export interface ExpressionPart extends Part {
-  value: string;
   groupStack: number[];
   terminator?: string | string[];
   allowEscapes: boolean;
@@ -23,7 +21,6 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
   name: "EXPRESSION",
 
   enter(expression) {
-    expression.value = "";
     expression.groupStack = [];
     expression.allowEscapes = expression.allowEscapes === true;
     expression.skipOperators = expression.skipOperators === true;
@@ -32,7 +29,7 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
       expression.terminatedByWhitespace === true;
   },
 
-  eol(str, expression) {
+  eol(_, expression) {
     const depth = expression.groupStack.length;
 
     if (
@@ -42,8 +39,6 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
       this.exitState();
       return;
     }
-
-    expression.value += str;
   },
 
   eof(expression) {
@@ -58,45 +53,41 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
       if (parentState === STATE.ATTRIBUTE) {
         if (!this.currentAttribute!.name) {
           return this.notifyError(
-            expression.pos,
+            expression,
             "MALFORMED_OPEN_TAG",
             'EOF reached while parsing attribute name for the "' +
-              this.currentOpenTag!.tagName.value +
+              this.read(this.currentOpenTag!.tagName) +
               '" tag'
           );
         }
 
         return this.notifyError(
-          expression.pos,
+          expression,
           "MALFORMED_OPEN_TAG",
           'EOF reached while parsing attribute value for the "' +
-            this.currentAttribute!.name.value +
+            this.read(this.currentAttribute!.name) +
             '" attribute'
         );
       } else if (parentState === STATE.TAG_NAME) {
         return this.notifyError(
-          expression.pos,
+          expression,
           "MALFORMED_OPEN_TAG",
           "EOF reached while parsing tag name"
         );
       } else if (parentState === STATE.PLACEHOLDER) {
         return this.notifyError(
-          expression.pos,
+          expression,
           "MALFORMED_PLACEHOLDER",
           "EOF reached while parsing placeholder"
         );
       }
 
       return this.notifyError(
-        expression.pos,
+        expression,
         "INVALID_EXPRESSION",
         "EOF reached while parsing expression"
       );
     }
-  },
-
-  return(_, childPart, expression) {
-    expression.value += (childPart as ValuePart).value;
   },
 
   char(ch, code, expression) {
@@ -106,9 +97,7 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
       if (expression.terminatedByWhitespace && isWhitespaceCode(code)) {
         const operator = !expression.skipOperators && checkForOperator(this);
 
-        if (operator) {
-          expression.value += operator;
-        } else {
+        if (!operator) {
           this.exitState();
         }
 
@@ -117,24 +106,20 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
 
       if (
         expression.terminator &&
-        this.checkForTerminator(expression.terminator, ch)
+        checkForTerminator(this, expression.terminator, ch)
       ) {
         this.exitState();
         return;
       }
 
       if (expression.allowEscapes && code === CODE.BACK_SLASH) {
-        expression.value += this.lookAtCharAhead(1);
         this.skip(1);
         return;
       }
     }
 
     if (code === CODE.SINGLE_QUOTE || code === CODE.DOUBLE_QUOTE) {
-      return this.enterState(STATE.STRING, {
-        quoteChar: ch,
-        quoteCharCode: code,
-      });
+      return this.enterState(STATE.STRING, { quoteCharCode: code });
     } else if (code === CODE.BACKTICK) {
       return this.enterState(STATE.TEMPLATE_STRING);
     } else if (code === CODE.FORWARD_SLASH) {
@@ -142,11 +127,9 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
       const nextCode = this.lookAtCharCodeAhead(1);
       if (nextCode === CODE.FORWARD_SLASH) {
         this.enterState(STATE.JS_COMMENT_LINE);
-        this.skip(1);
         return;
       } else if (nextCode === CODE.ASTERISK) {
         this.enterState(STATE.JS_COMMENT_BLOCK);
-        this.skip(1);
         return;
       } else if (
         !/[\]})A-Z0-9.<%]/i.test(this.getPreviousNonWhitespaceChar())
@@ -160,7 +143,6 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
       code === CODE.OPEN_CURLY_BRACE
     ) {
       expression.groupStack.push(code);
-      expression.value += ch;
       return;
     } else if (
       code === CODE.CLOSE_PAREN ||
@@ -169,7 +151,7 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
     ) {
       if (depth === 0) {
         return this.notifyError(
-          expression.pos,
+          expression,
           "INVALID_EXPRESSION",
           'Mismatched group. A closing "' +
             ch +
@@ -188,7 +170,7 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
           matchingGroupCharCode !== CODE.OPEN_CURLY_BRACE)
       ) {
         return this.notifyError(
-          expression.pos,
+          expression,
           "INVALID_EXPRESSION",
           'Mismatched group. A "' +
             ch +
@@ -197,12 +179,8 @@ export const EXPRESSION: StateDefinition<ExpressionPart> = {
             '" was expected.'
         );
       }
-
-      expression.value += ch;
       return;
     }
-
-    expression.value += ch;
   },
 };
 
@@ -226,10 +204,30 @@ function checkForOperator(parser: Parser) {
     );
     const match = operators.patternPrev.exec(previous);
     if (match) {
-      parser.rewind(1);
       return parser.consumeWhitespace();
     }
   }
 
   return false;
+}
+
+function checkForTerminator(parser: Parser, terminator: string | string[], ch: string) {
+  if (typeof terminator === "string") {
+    if (ch === terminator) {
+      return true;
+    } else if (terminator.length > 1) {
+      for (let i = 0; i < terminator.length; i++) {
+        if (parser.data[parser.pos + i] !== terminator[i]) {
+          return false;
+        }
+      }
+      return true;
+    }
+  } else {
+    for (let i = 0; i < terminator.length; i++) {
+      if (checkForTerminator(parser, terminator[i], ch)) {
+        return true;
+      }
+    }
+  }
 }

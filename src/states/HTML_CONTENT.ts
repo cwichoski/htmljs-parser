@@ -1,3 +1,4 @@
+import { checkForCDATA, checkForEscapedEscapedPlaceholder, checkForEscapedPlaceholder, checkForPlaceholder } from ".";
 import {
   Parser,
   CODE,
@@ -14,11 +15,14 @@ export const HTML_CONTENT: StateDefinition = {
   enter() {
     this.textParseMode = "html";
     this.isConcise = false; // Back into non-concise HTML parsing
+    this.startText();
+  },
+
+  return() {
+    this.startText();
   },
 
   eol(newLine) {
-    this.addText(newLine);
-
     if (this.beginMixedMode) {
       this.beginMixedMode = false;
       this.endHtmlBlock();
@@ -41,28 +45,23 @@ export const HTML_CONTENT: StateDefinition = {
 
   eof: Parser.prototype.htmlEOF,
 
-  char(ch, code) {
+  char(_, code) {
     if (code === CODE.OPEN_ANGLE_BRACKET) {
-      if (this.checkForCDATA()) {
-        return;
-      }
+      if (checkForCDATA(this)) return;
 
       const nextCode = this.lookAtCharCodeAhead(1);
 
       if (this.lookAheadFor("!--")) {
         this.enterState(STATE.HTML_COMMENT);
-        this.skip(3);
       } else if (nextCode === CODE.EXCLAMATION) {
         // something like:
         // <!DOCTYPE html>
         // NOTE: We already checked for CDATA earlier and <!--
         this.enterState(STATE.DTD);
-        this.skip(1);
       } else if (nextCode === CODE.QUESTION) {
         // something like:
         // <?xml version="1.0"?>
         this.enterState(STATE.DECLARATION);
-        this.skip(1);
       } else if (nextCode === CODE.FORWARD_SLASH) {
         // something like:
         // </html>
@@ -79,28 +78,23 @@ export const HTML_CONTENT: StateDefinition = {
         // "<<"
         // "< "
         // We'll treat this left angle bracket as text
-        this.addText("<");
       } else {
         this.enterState(STATE.OPEN_TAG);
       }
-    } else if (this.checkForEscapedEscapedPlaceholder(ch, code)) {
-      this.addText("\\");
+    } else if (checkForEscapedEscapedPlaceholder(this, code)) {
       this.skip(1);
-    } else if (this.checkForEscapedPlaceholder(ch, code)) {
-      this.addText("$");
+    } else if (checkForEscapedPlaceholder(this, code)) {
       this.skip(1);
-    } else if (this.checkForPlaceholder(ch, code)) {
+    } else if (checkForPlaceholder(this, code)) {
       // We went into placeholder state...
       this.endText();
     } else if (
       code === CODE.DOLLAR &&
       isWhitespaceCode(this.lookAtCharCodeAhead(1)) &&
+      // TODO: optimize below line
       /^\s*$/.test(this.substring(0, this.pos).split("\n").pop()!) // beginning of line
     ) {
-      this.skip(1);
       this.enterState(STATE.INLINE_SCRIPT);
-    } else {
-      this.addText(ch);
     }
   },
 };

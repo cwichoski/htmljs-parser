@@ -4,7 +4,6 @@ import {
   STATE,
   isWhitespaceCode,
   StateDefinition,
-  ValuePart,
   BODY_MODE,
 } from "../internal";
 
@@ -12,9 +11,9 @@ import {
 export const CONCISE_HTML_CONTENT: StateDefinition = {
   name: "CONCISE_HTML_CONTENT",
 
-  eol(newLine) {
-    this.addText(newLine);
+  eol() {
     this.indent = "";
+    this.startText();
   },
 
   eof: Parser.prototype.htmlEOF,
@@ -28,29 +27,44 @@ export const CONCISE_HTML_CONTENT: StateDefinition = {
     this.indent = "";
 
     switch (childState) {
-      case STATE.JS_COMMENT_LINE:
+      case STATE.JS_COMMENT_LINE: {
+        this.notify("comment", {
+          pos: childPart.pos,
+          endPos: childPart.endPos,
+          value: {
+            pos: childPart.pos + 2, // strip //
+            endPos: childPart.endPos,
+          },
+        });
+        break;
+      }
       case STATE.JS_COMMENT_BLOCK: {
-        this.notifiers.notifyComment(childPart);
+        this.notify("comment", {
+          pos: childPart.pos,
+          endPos: childPart.endPos,
+          value: {
+            pos: childPart.pos + 2, // strip /*
+            endPos: childPart.endPos - 2, // strip */,
+          },
+        });
 
-        if ((childPart as ValuePart).value[1] === "*") {
-          // Make sure there is only whitespace on the line
-          // after the ending "*/" sequence
-          this.enterState(STATE.CHECK_TRAILING_WHITESPACE, {
-            handler(err) {
-              if (err) {
-                // This is a non-whitespace! We don't allow non-whitespace
-                // after matching two or more hyphens. This is user error...
-                this.notifyError(
-                  this.pos,
-                  "INVALID_CHARACTER",
-                  'A non-whitespace of "' +
-                    err.ch +
-                    '" was found after a JavaScript block comment.'
-                );
-              }
-            },
-          });
-        }
+        // Make sure there is only whitespace on the line
+        // after the ending "*/" sequence
+        this.enterState(STATE.CHECK_TRAILING_WHITESPACE, {
+          handler(err) {
+            if (err) {
+              // This is a non-whitespace! We don't allow non-whitespace
+              // after matching two or more hyphens. This is user error...
+              this.notifyError(
+                this.pos,
+                "INVALID_CHARACTER",
+                'A non-whitespace of "' +
+                  err.ch +
+                  '" was found after a JavaScript block comment.'
+              );
+            }
+          },
+        });
 
         break;
       }
@@ -59,6 +73,7 @@ export const CONCISE_HTML_CONTENT: StateDefinition = {
 
   char(ch, code) {
     if (isWhitespaceCode(code)) {
+      this.endText();
       this.indent += ch;
     } else {
       // eslint-disable-next-line no-constant-condition
@@ -97,7 +112,7 @@ export const CONCISE_HTML_CONTENT: StateDefinition = {
             this.pos,
             "INVALID_BODY",
             'The "' +
-              parent.tagName.value +
+              this.read(parent.tagName) +
               '" tag does not allow nested body content'
           );
           return;
@@ -137,7 +152,6 @@ export const CONCISE_HTML_CONTENT: StateDefinition = {
         code === CODE.DOLLAR &&
         isWhitespaceCode(this.lookAtCharCodeAhead(1))
       ) {
-        this.skip(1);
         this.enterState(STATE.INLINE_SCRIPT);
         return;
       }
@@ -159,11 +173,9 @@ export const CONCISE_HTML_CONTENT: StateDefinition = {
         const nextCode = this.lookAtCharCodeAhead(1);
         if (nextCode === CODE.FORWARD_SLASH) {
           this.enterState(STATE.JS_COMMENT_LINE);
-          this.skip(1);
           return;
         } else if (nextCode === CODE.ASTERISK) {
           this.enterState(STATE.JS_COMMENT_BLOCK);
-          this.skip(1);
           return;
         } else {
           this.notifyError(

@@ -1,24 +1,23 @@
 "use strict";
 import {
-  createNotifiers,
   BODY_MODE,
   CODE,
   STATE,
   peek,
   isWhitespaceCode,
   htmlTags,
-  getTagName,
+  Notifications,
+  Pos,
+  ExpressionPos,
+  TemplatePos,
 } from "../internal";
 
-export interface Part {
-  pos: number;
-  endPos: number;
+export interface PartMeta {
   parentState: StateDefinition;
 }
-
-export interface ValuePart extends Part {
-  value: string;
-}
+export interface Part extends PartMeta, Pos {}
+export interface ExpressionPart extends PartMeta, ExpressionPos {}
+export interface TemplatePart extends PartMeta, TemplatePos {}
 
 export interface StateDefinition<P extends Part = Part> {
   name: string;
@@ -47,8 +46,6 @@ export class Parser {
   public state!: StateDefinition;
   public parts!: Part[]; // Used to keep track of parts such as CDATA, expressions, declarations, etc.
   public activePart!: Part; // The current part at the top of the part stack
-  public forward!: boolean;
-  public notifiers: ReturnType<typeof createNotifiers>;
   public currentOpenTag: STATE.OpenTagPart | undefined; // Used to reference the current open tag that is being parsed
   public currentAttribute: STATE.AttrPart | undefined; // Used to reference the current attribute that is being parsed
   public withinAttrGroup!: boolean; // Set to true if the parser is within a concise mode attribute group
@@ -63,6 +60,8 @@ export class Parser {
   public textPos!: number; // Used to buffer text that is found within the body of a tag
   public text!: string; // Used to buffer text that is found within the body of a tag
   public textParseMode!: "html" | "cdata" | "parsed-text" | "static-text";
+  public notifications: Notifications[] | undefined;
+  public done!: boolean;
   public blockStack!: ((
     | STATE.OpenTagPart
     | {
@@ -72,19 +71,17 @@ export class Parser {
       }
   ) & { body?: BODY_MODE; nestedIndent?: string })[]; // Used to keep track of HTML tags and HTML blocks
 
-  constructor(listeners) {
-    this.reset();
-    this.notifiers = createNotifiers(this, listeners);
-  }
-
-  reset() {
-    this.pos = -1;
-    this.maxPos = -1;
-    this.parts = [];
-    this.forward = true;
+  constructor(data: string, filename: string) {
+    this.data = data;
+    this.filename = filename;
+    this.pos = data.charCodeAt(0) === 0xfeff ? 1 : 0; // https://en.wikipedia.org/wiki/Byte_order_mark
+    this.maxPos = data.length;
+    this.activePart = { pos: this.pos, endPos: this.pos } as Part;
+    this.parts = [this.activePart];
     this.textPos = -1;
-    this.text = "";
     this.textParseMode = "html";
+    this.done = false;
+    this.notifications = undefined;
     this.currentOpenTag = undefined;
     this.currentAttribute = undefined;
     this.blockStack = [];
@@ -97,6 +94,13 @@ export class Parser {
     this.htmlBlockIndent = undefined;
     this.beginMixedMode = false;
     this.endingMixedModeAtEOL = false;
+    this.state = STATE.CONCISE_HTML_CONTENT;
+
+    STATE.CONCISE_HTML_CONTENT.enter!.call(this, this.activePart, undefined);
+  }
+
+  read(node: Pos) {
+    return this.substring(node.pos, node.endPos);
   }
 
   enterState<P extends Part = Part>(
@@ -115,9 +119,10 @@ export class Parser {
     const activePart = (this.activePart = part as unknown as P);
     this.state = state as StateDefinition;
     this.parts.push(activePart);
-    part.pos = this.pos;
+    part.pos = this.pos + 1;
     part.parentState = parentState;
     state.enter?.call(this, activePart, parentState);
+
     return this.activePart;
   }
 
@@ -126,8 +131,8 @@ export class Parser {
       for (let i = 0; i < includedEndChars.length; i++) {
         if (this.data[this.pos + i] !== includedEndChars[i]) {
           if (this.pos + i >= this.maxPos) {
-            (this as Parser).notifyError(
-              this.activePart.pos,
+            this.notifyError(
+              this.activePart,
               "UNEXPECTED_EOF",
               "EOF reached with current part incomplete"
             );
@@ -147,36 +152,33 @@ export class Parser {
     const parentPart = (this.activePart = peek(this.parts)!);
 
     childPart.endPos = this.pos;
-
-    if (childState.exit) {
-      childState.exit.call(this, childPart);
-    }
+    childState.exit?.call(this, childPart);
 
     if (parentState.return) {
       parentState.return.call(this, childState, childPart, parentPart);
     }
-
-    this.forward = false;
   }
 
-  checkForTerminator(terminator: string | string[], ch: string) {
-    if (typeof terminator === "string") {
-      if (ch === terminator) {
-        return true;
-      } else if (terminator.length > 1) {
-        for (let i = 0; i < terminator.length; i++) {
-          if (this.data[this.pos + i] !== terminator[i]) {
-            return false;
-          }
-        }
-        return true;
+  get value() {
+    const { notifications } = this;
+    if (notifications) {
+      if (notifications.length === 2) {
+        this.notifications = undefined;
+        return notifications as unknown as Notifications;
+      } else {
+        return notifications.splice(0, 2) as unknown as Notifications;
       }
+    }
+  }
+
+  notify<T extends Notifications[0]>(
+    type: T,
+    data: Extract<Notifications, [T, any]>[1]
+  ) {
+    if (this.notifications) {
+      this.notifications.push(type as any, data);
     } else {
-      for (let i = 0; i < terminator.length; i++) {
-        if (this.checkForTerminator(terminator[i], ch)) {
-          return true;
-        }
-      }
+      this.notifications = [type, data] as any;
     }
   }
 
@@ -186,13 +188,19 @@ export class Parser {
    */
   lookAheadFor(str: string, startPos = this.pos + 1) {
     // Have we read enough chunks to read the string that we need?
-    const endPos = startPos + str.length;
+    const len = str.length;
+    const endPos = startPos + len;
 
-    if (endPos > this.maxPos + 1 || str !== this.substring(startPos, endPos)) {
-      return undefined;
+    if (endPos < this.maxPos) {
+      const { data } = this;
+      for (let i = 0; i < len; i++) {
+        if (str[i] !== data[startPos + i]) {
+          return undefined;
+        }
+      }
+
+      return str;
     }
-
-    return str;
   }
 
   /**
@@ -232,12 +240,9 @@ export class Parser {
     return tagName ? htmlTags.isOpenTagOnly(tagName.toLowerCase()) : false;
   }
 
-  addText(text: string) {
-    if (this.text) {
-      this.text += text;
-    } else {
-      this.textPos = this.pos;
-      this.text = text;
+  startText(offset = 0) {
+    if (this.textPos === -1) {
+      this.textPos = this.pos + offset;
     }
   }
 
@@ -246,14 +251,13 @@ export class Parser {
    */
   endText() {
     if (this.textPos !== -1) {
-      this.notifiers.notifyText(
-        this.textPos,
-        this.textPos + this.text.length,
-        this.text,
-        this.textParseMode
-      );
-      // always clear text buffer...
-      this.text = "";
+      if (this.textPos < this.pos) {
+        this.notify("text", {
+          pos: this.textPos,
+          endPos: this.pos,
+        });
+      }
+
       this.textPos = -1;
     }
   }
@@ -293,15 +297,6 @@ export class Parser {
    * and we are exiting out of non-concise mode.
    */
   endHtmlBlock() {
-    if (
-      this.text &&
-      (this.isWithinSingleLineHtmlBlock || this.htmlBlockDelimiter)
-    ) {
-      // Remove the new line that was required to end a single line
-      // HTML block or a delimited block
-      this.text = this.text.replace(/(\r\n|\n)$/, "");
-    }
-
     // End any text
     this.endText();
 
@@ -318,9 +313,9 @@ export class Parser {
         // The current block is for an HTML tag and it still open. When a tag is tag is closed
         // it is removed from the stack
         this.notifyError(
-          curBlock.pos,
+          curBlock,
           "MISSING_END_TAG",
-          'Missing ending "' + curBlock.tagName.value + '" tag'
+          'Missing ending "' + this.read(curBlock.tagName) + '" tag'
         );
         return;
       }
@@ -354,9 +349,9 @@ export class Parser {
           //
           // NOTE: We have already closed tags that are open tag only or self-closed
           this.notifyError(
-            curBlock.pos,
+            curBlock,
             "MISSING_END_TAG",
-            'Missing ending "' + curBlock.tagName.value + '" tag'
+            'Missing ending "' + this.read(curBlock.tagName) + '" tag'
           );
           return;
         }
@@ -373,120 +368,97 @@ export class Parser {
     }
   }
 
-  notifyError(pos: number, errorCode: string, message: string) {
-    this.notifiers.notifyError(pos, errorCode, message);
+  notifyError(pos: number | Pos, code: string, message: string) {
+    if (typeof pos === "number") {
+      this.notify("error", {
+        code,
+        message,
+        pos,
+        endPos: -1,
+      });
+    } else {
+      this.notify("error", {
+        code,
+        message,
+        pos: pos.pos,
+        endPos: pos.endPos,
+      });
+    }
+    
     this.end();
   }
 
-  closeTag(pos?: number, endPos?: number, tagName?: ValuePart) {
+  closeTag(closeTag?: Pos) {
     const lastTag = this.blockStack.pop();
 
     if (!lastTag || lastTag.type !== "tag") {
       return this.notifyError(
-        pos!,
+        closeTag!,
         "EXTRA_CLOSING_TAG",
-        'The closing "' + tagName!.value + '" tag was not expected'
+        'The closing "' +
+          this.read(closeTag!) +
+          '" tag was not expected'
       );
     }
 
-    if (tagName?.value) {
-      const expectedCloseTagName = getTagName(lastTag);
+    if (closeTag) {
+      const closeTagNameStart = closeTag.pos + 2; // strip </
+      const closeTagNameEnd = closeTag.endPos - 1; // strip >
 
-      if (tagName.value !== (expectedCloseTagName || "div")) {
-        const shorthandEndPos = Math.max(
-          lastTag.shorthandId ? lastTag.shorthandId.endPos : 0,
-          lastTag.shorthandClassNames
-            ? lastTag.shorthandClassNames[
-                lastTag.shorthandClassNames.length - 1
-              ].endPos
-            : 0
-        );
+      if (closeTagNameStart < closeTagNameEnd!) {
+        // TODO: instead of substringing the tagName, we should string compare two ranges in the source text.
+        const expectedCloseTagName = this.read(lastTag.tagName);
+        const closeTagName = this.substring(closeTagNameStart, closeTagNameEnd);
 
-        if (
-          !shorthandEndPos ||
-          // accepts including the tag class/id shorthands as part of the close tag name.
-          tagName.value !== this.substring(lastTag.tagName.pos, shorthandEndPos)
-        ) {
-          return this.notifyError(
-            pos!,
-            "MISMATCHED_CLOSING_TAG",
-            'The closing "' +
-              tagName.value +
-              '" tag does not match the corresponding opening "' +
-              (expectedCloseTagName || "div") +
-              '" tag'
+        if (closeTagName !== (expectedCloseTagName || "div")) {
+          const lastTagName = lastTag.tagName;
+          // TODO: refactor this entire thing.
+          const shorthandEndPos = Math.max(
+            lastTagName.shorthandId ? lastTagName.shorthandId.endPos : 0,
+            lastTagName.shorthandClassNames
+              ? lastTagName.shorthandClassNames[
+                  lastTagName.shorthandClassNames.length - 1
+                ].endPos
+              : 0
           );
+
+          if (
+            !shorthandEndPos ||
+            // accepts including the tag class/id shorthands as part of the close tag name.
+            closeTagName !== this.substring(lastTagName.pos, shorthandEndPos)
+          ) {
+            return this.notifyError(
+              closeTag,
+              "MISMATCHED_CLOSING_TAG",
+              'The closing "' +
+                this.read(closeTag) +
+                '" tag does not match the corresponding opening "' +
+                (expectedCloseTagName || "div") +
+                '" tag'
+            );
+          }
         }
       }
-    }
 
-    this.notifiers.notifyCloseTag(pos, endPos, tagName);
+      this.notify("closeTag", {
+        pos: closeTag.pos,
+        endPos: closeTag.endPos,
+        value: {
+          pos: closeTagNameStart,
+          endPos: closeTagNameEnd,
+        },
+      });
+    } else if (this.isConcise) {
+      this.notify("closeTag", {
+        pos: this.pos,
+        endPos: this.pos,
+        value: undefined,
+      });
+    }
 
     if (lastTag.beginMixedMode) {
       this.endingMixedModeAtEOL = true;
     }
-  }
-
-  // --------------------------
-
-  checkForPlaceholder(ch: string, code: number) {
-    if (code === CODE.DOLLAR) {
-      const nextCode = this.lookAtCharCodeAhead(1);
-      if (nextCode === CODE.OPEN_CURLY_BRACE) {
-        // The placeholder expression starts after first curly brace so skip
-        // past the {
-        this.enterState(STATE.PLACEHOLDER, { escape: true });
-        this.skip(1);
-        return true;
-      } else if (
-        nextCode === CODE.EXCLAMATION &&
-        this.lookAtCharCodeAhead(2) === CODE.OPEN_CURLY_BRACE
-      ) {
-        // The placeholder expression starts after first curly brace so skip
-        // past the !{
-        this.enterState(STATE.PLACEHOLDER, { escape: false });
-        this.skip(2);
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  checkForEscapedPlaceholder(ch: string, code: number) {
-    // Look for \${ and \$!{
-    if (code === CODE.BACK_SLASH) {
-      if (this.lookAtCharCodeAhead(1) === CODE.DOLLAR) {
-        if (this.lookAtCharCodeAhead(2) === CODE.OPEN_CURLY_BRACE) {
-          return true;
-        } else if (this.lookAtCharCodeAhead(2) === CODE.EXCLAMATION) {
-          if (this.lookAtCharCodeAhead(3) === CODE.OPEN_CURLY_BRACE) {
-            return true;
-          }
-        }
-      }
-    }
-
-    return false;
-  }
-
-  checkForEscapedEscapedPlaceholder(ch: string, code: number) {
-    // Look for \\${ and \\$!{
-    if (code === CODE.BACK_SLASH) {
-      if (this.lookAtCharCodeAhead(1) === CODE.BACK_SLASH) {
-        if (this.lookAtCharCodeAhead(2) === CODE.DOLLAR) {
-          if (this.lookAtCharCodeAhead(3) === CODE.OPEN_CURLY_BRACE) {
-            return true;
-          } else if (this.lookAtCharCodeAhead(3) === CODE.EXCLAMATION) {
-            if (this.lookAtCharCodeAhead(4) === CODE.OPEN_CURLY_BRACE) {
-              return true;
-            }
-          }
-        }
-      }
-    }
-
-    return false;
   }
 
   lookPastWhitespaceFor(str: string, start = 1) {
@@ -502,55 +474,23 @@ export class Parser {
   }
 
   onlyWhitespaceRemainsOnLine(offset = 1) {
-    return /^\s*\n/.test(this.substring(this.pos + offset));
+    for (let i = this.pos + offset; i < this.maxPos; i++) {
+      const code = this.data.charCodeAt(i);
+      if (code === CODE.NEWLINE) return true;
+      if (!isWhitespaceCode(code)) break;
+    }
+
+    return false;
   }
 
   consumeWhitespace() {
-    let ahead = 1;
+    let ahead = 0;
     let whitespace = "";
     while (isWhitespaceCode(this.lookAtCharCodeAhead(ahead))) {
       whitespace += this.lookAtCharAhead(ahead++);
     }
     this.skip(whitespace.length);
     return whitespace;
-  }
-
-  checkForClosingTag() {
-    // Look ahead to see if we found the closing tag that will
-    // take us out of the EXPRESSION state...
-    const match =
-      this.lookAheadFor("/>") ||
-      this.lookAheadFor("/" + getTagName(peek(this.blockStack)) + ">");
-
-    if (match) {
-      if (this.state === STATE.JS_COMMENT_LINE) {
-        this.exitState();
-      }
-
-      const pos = this.pos;
-      const endPos = this.skip(match.length + 1);
-      this.endText();
-      this.closeTag(pos, endPos, {
-        value: match.slice(1, -1),
-        pos: pos + 2,
-        endPos: endPos - 1,
-      } as ValuePart);
-      this.enterState(STATE.HTML_CONTENT);
-      this.forward = false;
-      return true;
-    }
-
-    return false;
-  }
-
-  checkForCDATA() {
-    if (this.lookAheadFor("![CDATA[")) {
-      this.enterState(STATE.CDATA);
-      this.skip(8);
-      return true;
-    }
-
-    return false;
   }
 
   handleDelimitedBlockEOL(newLine: string) {
@@ -612,7 +552,8 @@ export class Parser {
     const last =
       this.blockStack.length && this.blockStack[this.blockStack.length - 1];
 
-    if (!last || last.type === "html" || !last.tagName.value) {
+    // TODO: is the last condition necessary.
+    if (!last || last.type === "html" || last.tagName.pos === last.tagName.endPos) {
       throw new Error(
         'The "parsed text content" parser state is only allowed within a tag'
       );
@@ -656,66 +597,40 @@ export class Parser {
     }
   }
 
-  parse(data: string, filename: string) {
-    // call the constructor function again because we have a contract that
-    // it will fully reset the parser
-    this.reset();
+  next() {
+    if (this.notifications) return this;
 
-    this.filename = filename;
-    this.data = data;
-    this.maxPos = data.length;
-
-    // Enter initial state
-    this.enterState(STATE.CONCISE_HTML_CONTENT);
-
-    // Move to first position
-    // Skip the byte order mark (BOM) sequence
-    // at the beginning of the file if there is one:
-    // - https://en.wikipedia.org/wiki/Byte_order_mark
-    // > The Unicode Standard permits the BOM in UTF-8, but does not require or recommend its use.
-    this.pos = data.charCodeAt(0) === 0xfeff ? 1 : 0;
-
-    let pos: number;
-    while ((pos = this.pos) <= this.maxPos) {
-      const ch = data[pos];
-      const code = ch && ch.charCodeAt(0);
-      const state = this.state;
-      let length = 1;
+    while (this.pos < this.maxPos) {
+      const ch = this.data.charAt(this.pos);
+      const code = this.data.charCodeAt(this.pos);
 
       if (code === CODE.NEWLINE) {
-        state.eol?.call(this, ch, this.activePart);
-      } else if (code === CODE.CARRIAGE_RETURN) {
-        const nextPos = pos + 1;
-        if (
-          nextPos < data.length &&
-          data.charCodeAt(nextPos) === CODE.NEWLINE
-        ) {
-          state.eol?.call(this, "\r\n", this.activePart);
-          length = 2;
+        if (this.lookAtCharCodeAhead(-1) === CODE.CARRIAGE_RETURN) {
+          this.state.eol?.call(this, "\r\n", this.activePart);
+          this.pos += 2;
+        } else {
+          this.state.eol?.call(this, ch, this.activePart);
+          this.pos++;
         }
-      } else if (code) {
-        // We assume that every state will have "char" function
-        // TODO: only check during debug.
-        if (!state.char) {
-          throw new Error(
-            `State ${state.name} has no "char" function (${JSON.stringify(
-              ch
-            )}, ${code})`
-          );
-        }
-        state.char.call(this, ch, code, this.activePart);
       } else {
-        state.eof?.call(this, this.activePart);
+        this.state.char!.call(this, ch, code, this.activePart);
+        this.pos++;
       }
 
-      // move to next position
-      if (this.forward) {
-        this.pos += length;
-      } else {
-        this.forward = true;
-      }
+      if (this.notifications) return this;
     }
 
-    this.notifiers.notifyFinish();
+    const { eof } = this.state;
+    if (eof) {
+      eof.call(this, this.activePart);
+      if (this.notifications) return this;
+    }
+
+    this.done = true;
+    return this;
+  }
+
+  [Symbol.iterator]() {
+    return this;
   }
 }

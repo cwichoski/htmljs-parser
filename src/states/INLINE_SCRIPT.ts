@@ -1,7 +1,7 @@
-import { CODE, Part, STATE, StateDefinition } from "../internal";
+import { CODE, Part, Pos, STATE, StateDefinition } from "../internal";
 
 export interface InlineScriptPart extends Part {
-  value: string;
+  value: Pos;
   block: boolean;
 }
 
@@ -10,24 +10,31 @@ export const INLINE_SCRIPT: StateDefinition<InlineScriptPart> = {
 
   enter(inlineScript) {
     this.endText();
-    inlineScript.value = "";
+    this.skip(1); // skip the whitespace after $
     inlineScript.block = false;
   },
 
   exit(inlineScript) {
-    this.notifiers.notifyScriptlet(inlineScript);
+    this.notify("scriptlet", {
+      pos: inlineScript.pos,
+      endPos: inlineScript.endPos,
+      block: inlineScript.block,
+      value: {
+        pos: inlineScript.value.pos,
+        endPos: inlineScript.value.endPos
+      }
+    });
   },
 
   return(_, childPart, inlineScript) {
-    inlineScript.value += (childPart as STATE.ExpressionPart).value;
-    if (inlineScript.block) this.skip(1);
+    inlineScript.value = childPart;
+    if (inlineScript.block) this.skip(1); // skip }
     this.exitState();
   },
 
   char(_, code, inlineScript) {
     if (code === CODE.OPEN_CURLY_BRACE) {
       inlineScript.block = true;
-      inlineScript.value += this.consumeWhitespace();
       this.enterState(STATE.EXPRESSION, {
         terminator: "}",
         skipOperators: true,

@@ -20,9 +20,8 @@ export const CHECK_TRAILING_WHITESPACE: StateDefinition<CheckTrailingWhitespaceP
       handler.call(this, err, eof);
     },
 
-    eol: function () {
-      this.exitState();
-      this.forward = true;
+    eol(newline) {
+      this.exitState(newline);
     },
 
     eof: function (part) {

@@ -1,3 +1,4 @@
+import { checkForClosingTag } from ".";
 import { Parser, CODE, StateDefinition } from "../internal";
 
 // We enter STATE.STATIC_TEXT_CONTENT when a listener manually chooses
@@ -12,8 +13,6 @@ export const STATIC_TEXT_CONTENT: StateDefinition = {
   },
 
   eol(newLine) {
-    this.addText(newLine);
-
     if (this.isWithinSingleLineHtmlBlock) {
       // We are parsing "HTML" and we reached the end of the line. If we are within a single
       // line HTML block then we should return back to the state to parse concise HTML.
@@ -30,14 +29,10 @@ export const STATIC_TEXT_CONTENT: StateDefinition = {
 
   eof: Parser.prototype.htmlEOF,
 
-  char(ch, code) {
+  char(_, code) {
     // See if we need to see if we reached the closing tag...
     if (!this.isConcise && code === CODE.OPEN_ANGLE_BRACKET) {
-      if (this.checkForClosingTag()) {
-        return;
-      }
+      checkForClosingTag(this);
     }
-
-    this.addText(ch);
   },
 };

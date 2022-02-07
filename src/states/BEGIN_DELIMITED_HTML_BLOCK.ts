@@ -19,6 +19,7 @@ export const BEGIN_DELIMITED_HTML_BLOCK: StateDefinition = {
       this.htmlBlockDelimiter += ch;
     } else if (!this.onlyWhitespaceRemainsOnLine()) {
       this.isWithinSingleLineHtmlBlock = true;
+      if (code === CODE.SPACE) this.skip(1);
       this.beginHtmlBlock();
     }
   },

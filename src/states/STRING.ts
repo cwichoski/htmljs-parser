@@ -1,19 +1,18 @@
-import { CODE, StateDefinition, ValuePart } from "../internal";
+import { CODE, StateDefinition, Part } from "../internal";
 
-export interface StringPart extends ValuePart {
-  quoteChar: string;
+export interface StringPart extends Part {
   quoteCharCode: number;
 }
 
 export const STRING: StateDefinition<StringPart> = {
   name: "STRING",
 
-  enter(string) {
-    string.value = string.quoteChar;
-  },
-
-  eol(str, string) {
-    string.value += str;
+  eol() {
+    this.notifyError(
+      this.pos,
+      "INVALID_STRING",
+      "EOL reached while parsing string expression"
+    );
   },
 
   eof() {
@@ -25,11 +24,7 @@ export const STRING: StateDefinition<StringPart> = {
   },
 
   char(ch, code, string) {
-    string.value += ch;
-
     if (code === CODE.BACK_SLASH) {
-      // Handle string escape sequence
-      string.value += this.lookAtCharAhead(1);
       this.skip(1);
     } else if (code === string.quoteCharCode) {
       this.exitState(ch);

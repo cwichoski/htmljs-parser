@@ -2,13 +2,10 @@ import {
   STATE,
   CODE,
   isWhitespaceCode,
-  cloneValue,
   Part,
   StateDefinition,
-  ValuePart,
 } from "../internal";
 
-const defaultName = { value: "default" } as unknown as ValuePart;
 const enum ATTR_STATE {
   NAME,
   VALUE,
@@ -18,9 +15,9 @@ const enum ATTR_STATE {
 
 export interface AttrPart extends Part {
   state: undefined | ATTR_STATE;
-  name: undefined | ValuePart;
-  value: undefined | ValuePart;
-  argument: undefined | ValuePart;
+  name: undefined | Part;
+  value: undefined | Part;
+  argument: undefined | Part;
   default: boolean;
   spread: boolean;
   method: boolean;
@@ -37,15 +34,67 @@ export const ATTRIBUTE: StateDefinition<AttrPart> = {
     attr.state = undefined;
     attr.name = undefined;
     attr.value = undefined;
-    attr.argument = undefined;
     attr.bound = false;
     attr.method = false;
     attr.spread = false;
-    attr.default = this.currentOpenTag!.attributes.length === 0;
+    attr.default = !this.currentOpenTag!.hasAttributes;
+
+    if (attr.argument) {
+      attr.pos = attr.argument.pos - 1 // include (
+    } else {
+      attr.argument = undefined;
+    }
   },
 
-  exit() {
+  exit(attr) {
     this.currentAttribute = undefined;
+
+    if (attr.spread) {
+      this.notify("spreadAttr", {
+        pos: attr.pos,
+        endPos: attr.endPos,
+        value: {
+          pos: attr.value!.pos,
+          endPos: attr.value!.endPos
+        }
+      })
+    } else {
+      // TODO: actually emit these as we parse.
+      if (attr.name) {
+        this.notify("attrName", {
+          pos: attr.name.pos,
+          endPos: attr.name.endPos,
+          default: attr.default,
+        });
+      } else {
+        this.notify("attrName", {
+          pos: attr.pos,
+          endPos: attr.pos,
+          default: attr.default,
+        });
+      }
+
+      if (attr.value || attr.argument) {
+        this.notify("attrValue", {
+          pos: attr.pos,
+          endPos: attr.endPos,
+          bound: attr.bound,
+          method: attr.method,
+          argument: attr.argument && {
+            pos: attr.argument.pos - 1, // include (
+            endPos: attr.argument.endPos + 1, // include )
+            value: {
+              pos: attr.argument.pos,
+              endPos: attr.argument.endPos
+            }
+          },
+          value: attr.value && {
+            pos: attr.value.pos,
+            endPos: attr.value.endPos
+          },
+        });
+      }
+    }
   },
 
   eol() {
@@ -59,75 +108,63 @@ export const ATTRIBUTE: StateDefinition<AttrPart> = {
       this.exitState();
     } else {
       this.notifyError(
-        attr.pos,
+        attr,
         "MALFORMED_OPEN_TAG",
         'EOF reached while parsing attribute "' +
-          attr.name?.value +
+          attr.name +
           '" for the "' +
-          this.currentOpenTag!.tagName.value +
+          this.read(this.currentOpenTag!.tagName) +
           '" tag'
       );
     }
   },
 
   return(_, childPart, attr) {
-    const exprPart = childPart as ValuePart;
-    if (attr.state !== ATTR_STATE.NAME && !attr.name && attr.default) {
-      attr.name = defaultName;
-    }
     switch (attr.state) {
       case ATTR_STATE.NAME: {
-        attr.name = cloneValue(exprPart);
+        attr.name = childPart;
         attr.default = false;
         break;
       }
       case ATTR_STATE.ARGUMENT: {
         if (attr.argument) {
           this.notifyError(
-            exprPart.endPos,
+            childPart,
             "ILLEGAL_ATTRIBUTE_ARGUMENT",
             "An attribute can only have one set of arguments"
           );
           return;
         }
 
-        attr.argument = {
-          value: exprPart.value,
-          pos: exprPart.pos + 1, // ignore leading (
-          endPos: exprPart.endPos,
-        } as ValuePart;
+        attr.argument = childPart;
         this.skip(1); // ignore trailing )
         break;
       }
       case ATTR_STATE.BLOCK: {
         attr.method = true;
-        attr.value = {
-          value: exprPart.value,
-          pos: exprPart.pos + 1, // ignore leading {
-          endPos: exprPart.endPos,
-        } as ValuePart;
+        attr.value = childPart;
         this.skip(1); // ignore trailing }
         this.exitState();
         break;
       }
 
       case ATTR_STATE.VALUE: {
-        if (exprPart.value === "") {
+        if (childPart.pos === childPart.endPos) {
           return this.notifyError(
-            exprPart.pos,
+            childPart,
             "ILLEGAL_ATTRIBUTE_VALUE",
             "Missing value for attribute"
           );
         }
 
-        attr.value = cloneValue(exprPart);
+        attr.value = childPart;
         this.exitState();
         break;
       }
     }
   },
 
-  char(ch, code, attr) {
+  char(_, code, attr) {
     if (isWhitespaceCode(code)) {
       return;
     } else if (
@@ -135,13 +172,13 @@ export const ATTRIBUTE: StateDefinition<AttrPart> = {
       (code === CODE.COLON && this.lookAtCharCodeAhead(1) === CODE.EQUAL) ||
       (code === CODE.PERIOD && this.lookAheadFor(".."))
     ) {
-      if (code === CODE.COLON) {
+      if (code === CODE.PERIOD) {
+        attr.spread = true;
+        this.skip(2);
+      } else if (code === CODE.COLON) {
         attr.bound = true;
         this.skip(1);
         this.consumeWhitespace();
-      } else if (code === CODE.PERIOD) {
-        attr.spread = true;
-        this.skip(3);
       } else {
         this.consumeWhitespace();
       }
@@ -159,6 +196,7 @@ export const ATTRIBUTE: StateDefinition<AttrPart> = {
       attr.state = ATTR_STATE.ARGUMENT;
       this.enterState(STATE.EXPRESSION, {
         terminator: ")",
+        skipOperators: true
       });
     } else if (
       code === CODE.OPEN_CURLY_BRACE &&
@@ -166,14 +204,16 @@ export const ATTRIBUTE: StateDefinition<AttrPart> = {
     ) {
       attr.state = ATTR_STATE.BLOCK;
       this.enterState(STATE.EXPRESSION, {
-        terminatedByWhitespace: false,
         terminator: "}",
+        skipOperators: true,
       });
     } else if (!attr.name) {
       attr.state = ATTR_STATE.NAME;
+      this.rewind(1);
       this.enterState(STATE.EXPRESSION, {
         terminatedByWhitespace: true,
         skipOperators: true,
+        allowEscapes: true,
         terminator: [
           this.isConcise ? "]" : "/>",
           this.isConcise ? ";" : ">",
@@ -181,10 +221,8 @@ export const ATTRIBUTE: StateDefinition<AttrPart> = {
           "=",
           ",",
           "(",
-        ],
-        allowEscapes: true,
+        ]
       });
-      this.rewind(1);
     } else {
       this.exitState();
     }

@@ -1,36 +1,37 @@
-import { CODE, StateDefinition, ValuePart } from "../internal";
+import { CODE, StateDefinition } from "../internal";
 
 // We enter STATE.DTD after we encounter a "<!" while in the STATE.HTML_CONTENT.
 // We leave STATE.DTD if we see a ">".
-export const DTD: StateDefinition<ValuePart> = {
+export const DTD: StateDefinition = {
   name: "DTD",
 
-  enter(documentType) {
+  enter() {
     this.endText();
-    documentType.value = "";
+    this.skip(1); // skip !
   },
 
-  exit(documentType) {
-    this.notifiers.notifyDocumentType(documentType);
+  exit(docType) {
+    this.notify("doctype", {
+      pos: docType.pos,
+      endPos: docType.endPos,
+      value: {
+        pos: docType.pos + 2, // strip <!
+        endPos: docType.endPos - 1 // strip >
+      }
+    })
   },
 
-  eol(str, documentType) {
-    documentType.value += str;
-  },
-
-  eof(documentType) {
+  eof(docType) {
     this.notifyError(
-      documentType.pos,
+      docType,
       "MALFORMED_DOCUMENT_TYPE",
       "EOF reached while parsing document type"
     );
   },
 
-  char(ch, code, documentType) {
+  char(_, code) {
     if (code === CODE.CLOSE_ANGLE_BRACKET) {
       this.exitState(">");
-    } else {
-      documentType.value += ch;
     }
   },
 };
